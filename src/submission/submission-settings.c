@@ -6,6 +6,7 @@
 #include "settings-parser.h"
 #include "service-settings.h"
 #include "mail-storage-settings.h"
+#include "smtp-address.h"
 #include "submission-settings.h"
 
 #include <stddef.h>
@@ -83,6 +84,9 @@ static const struct setting_define submission_setting_defines[] = {
 	DEF(SET_ENUM, submission_relay_ssl),
 	DEF(SET_BOOL, submission_relay_ssl_verify),
 
+	DEF(SET_STR, submission_bcc),
+	DEF(SET_BOOL, submission_bcc_ignore_errors),
+
 	DEF(SET_STR_VARS, submission_relay_rawlog_dir),
 	DEF(SET_TIME, submission_relay_max_idle_time),
 
@@ -114,6 +118,9 @@ static const struct submission_settings submission_default_settings = {
 	.submission_relay_host = "",
 	.submission_relay_port = 25,
 	.submission_relay_trusted = FALSE,
+
+	.submission_bcc = "",
+	.submission_bcc_ignore_errors = FALSE,
 
 	.submission_relay_user = "",
 	.submission_relay_master_user = "",
@@ -207,6 +214,21 @@ submission_settings_verify(void *_set, pool_t pool ATTR_UNUSED, const char **err
 	}
 	if (*set->hostname == '\0')
 		set->hostname = p_strdup(pool, my_hostdomain());
+
+	if (set->submission_bcc[0] != '\0') {
+		struct smtp_address *bcc_addr;
+		const char *error;
+
+		if (smtp_address_parse_mailbox(
+			pool, set->submission_bcc,
+			SMTP_ADDRESS_PARSE_FLAG_ALLOW_LOCALPART,
+			&bcc_addr, &error) < 0) {
+			*error_r = t_strdup_printf(
+				"Invalid submission_bcc address '%s': %s",
+				set->submission_bcc, error);
+			return FALSE;
+		}
+	}
 #endif
 	return TRUE;
 }

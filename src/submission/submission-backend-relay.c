@@ -5,6 +5,7 @@
 #include "str-sanitize.h"
 #include "mail-user.h"
 #include "iostream-ssl.h"
+#include "smtp-address.h"
 #include "smtp-client.h"
 #include "smtp-client-connection.h"
 #include "smtp-client-transaction.h"
@@ -19,11 +20,27 @@ struct submission_backend_relay {
 	struct smtp_client_connection *conn;
 	struct smtp_client_transaction *trans;
 
+	/* BCC state tracking */
+	bool bcc_added:1;        /* BCC RCPT was added this transaction */
+	bool bcc_failed:1;       /* BCC RCPT was rejected */
+	bool bcc_ignore_errors:1; /* cached from settings */
+
 	bool trans_started:1;
 	bool trusted:1;
 };
 
 static struct submission_backend_vfuncs backend_relay_vfuncs;
+
+/* Forward declarations for BCC handling */
+struct relay_cmd_data_context;
+static void relay_cmd_data_callback(const struct smtp_reply *relay_reply,
+				    struct relay_cmd_data_context *data_ctx);
+
+struct relay_cmd_bcc_context {
+	struct submission_backend_relay *backend;
+};
+static void relay_cmd_bcc_rcpt_callback(const struct smtp_reply *relay_reply,
+					struct relay_cmd_bcc_context *bcc_ctx);
 
 /*
  * Common
@@ -166,6 +183,12 @@ backend_relay_trans_start(struct submission_backend *_backend,
 {
 	struct submission_backend_relay *backend =
 		(struct submission_backend_relay *)_backend;
+	struct client *client = backend->backend.client;
+
+	/* Reset BCC state for new transaction */
+	backend->bcc_added = FALSE;
+	backend->bcc_failed = FALSE;
+	backend->bcc_ignore_errors = client->set->submission_bcc_ignore_errors;
 
 	if (backend->trans == NULL) {
 		backend->trans_started = TRUE;
@@ -182,6 +205,7 @@ backend_relay_trans_start(struct submission_backend *_backend,
 			backend->trans, path, params,
 			backend_relay_trans_start_callback, backend);
 	}
+
 }
 
 static void
@@ -192,6 +216,8 @@ backend_relay_trans_free(struct submission_backend *_backend,
 		(struct submission_backend_relay *)_backend;
 
 	backend->trans_started = FALSE;
+	backend->bcc_added = FALSE;
+	backend->bcc_failed = FALSE;
 
 	if (backend->trans == NULL)
 		return;
@@ -520,8 +546,42 @@ backend_relay_cmd_rcpt(struct submission_backend *_backend,
 {
 	struct submission_backend_relay *backend =
 		(struct submission_backend_relay *)_backend;
+	struct client *client = backend->backend.client;
 	struct smtp_server_recipient *rcpt = srcpt->rcpt;
 	struct relay_cmd_rcpt_context *rcpt_cmd;
+
+	/* Add BCC recipient before first regular recipient.
+	   We add it here (on first RCPT) rather than during MAIL to ensure
+	   it's sent before regular recipients in the SMTP pipeline. */
+	if (!backend->bcc_added && client->set->submission_bcc[0] != '\0') {
+		struct smtp_address *bcc_addr;
+		const char *error;
+
+		if (smtp_address_parse_mailbox(
+			cmd->pool, client->set->submission_bcc,
+			SMTP_ADDRESS_PARSE_FLAG_ALLOW_LOCALPART,
+			&bcc_addr, &error) < 0) {
+			i_error("Invalid BCC address '%s': %s",
+				client->set->submission_bcc, error);
+		} else {
+			struct relay_cmd_bcc_context *bcc_ctx;
+
+			bcc_ctx = p_new(cmd->pool,
+					struct relay_cmd_bcc_context, 1);
+			bcc_ctx->backend = backend;
+
+			if (backend->trans == NULL)
+				(void)submission_backend_relay_init_transaction(backend, 0);
+
+			smtp_client_transaction_add_pool_rcpt(
+				backend->trans, cmd->pool, bcc_addr, NULL,
+				relay_cmd_bcc_rcpt_callback, bcc_ctx);
+
+			i_debug("Added BCC recipient: %s",
+				smtp_address_encode(bcc_addr));
+			backend->bcc_added = TRUE;
+		}
+	}
 
 	/* queue command (pipeline) */
 	rcpt_cmd = p_new(cmd->pool, struct relay_cmd_rcpt_context, 1);
@@ -607,6 +667,35 @@ struct relay_cmd_data_context {
 	struct smtp_server_cmd_ctx *cmd;
 	struct smtp_server_transaction *trans;
 };
+
+static void
+relay_cmd_data_callback(const struct smtp_reply *relay_reply,
+			struct relay_cmd_data_context *data_ctx);
+
+static void
+relay_cmd_bcc_rcpt_callback(const struct smtp_reply *relay_reply,
+			    struct relay_cmd_bcc_context *bcc_ctx)
+{
+	struct submission_backend_relay *backend = bcc_ctx->backend;
+
+	if (relay_reply->status == SMTP_CLIENT_COMMAND_ERROR_ABORTED) {
+		backend->bcc_failed = TRUE;
+		return;
+	}
+
+	if (!smtp_reply_is_success(relay_reply)) {
+		backend->bcc_failed = TRUE;
+		if (backend->bcc_ignore_errors) {
+			i_warning("BCC recipient rejected (ignored): %s",
+				  smtp_reply_log(relay_reply));
+		} else {
+			i_error("BCC recipient rejected: %s",
+				smtp_reply_log(relay_reply));
+		}
+	} else {
+		i_debug("BCC recipient accepted");
+	}
+}
 
 static void
 relay_cmd_data_rcpt_callback(const struct smtp_reply *relay_reply,
@@ -737,6 +826,15 @@ backend_relay_cmd_data(struct submission_backend *_backend,
 	i_assert(backend->trans != NULL);
 
 	backend_relay_cmd_data_init_callbacks(backend, trans);
+
+	/* Check BCC status - BCC was added during MAIL, and due to SMTP
+	   pipelining the RCPT response will have arrived before DATA */
+	if (backend->bcc_failed && !backend->bcc_ignore_errors) {
+		/* Strict mode: BCC was rejected, fail the DATA command */
+		smtp_server_reply(cmd, 550, "5.5.0",
+			"BCC recipient rejected by relay");
+		return -1;
+	}
 
 	smtp_client_transaction_send(backend->trans, data_input,
 				     relay_cmd_data_callback, data_ctx);
